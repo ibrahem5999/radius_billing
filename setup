@@ -82,13 +82,6 @@ test -h /usr/local/bin/radperf || {
 	ln -s /opt/networkradius/radperf/bin/radperf /usr/local/bin
 }
 
-if [ -d /opt/$VENDOR/$PROJECT ]; then
-	git -C /opt/$VENDOR/$PROJECT reset --hard
-	git -C /opt/$VENDOR/$PROJECT pull origin HEAD
-else
-	mkdir /opt/$VENDOR
-	git clone /tmp/$VENDOR-$PROJECT.git /opt/$VENDOR/$PROJECT
-fi
 
 shred -u /tmp/$VENDOR-$PROJECT.git
 
