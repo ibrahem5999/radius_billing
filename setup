@@ -1,0 +1,171 @@
+#!/bin/sh
+
+set -eux
+
+[ "${VENDOR:-}" -a "${PROJECT:-}" ] || { echo missing VENDOR/PROJECT environment variables; exit 1; }
+
+. /etc/os-release
+
+export DEBIAN_FRONTEND=noninteractive
+
+{
+	echo tzdata tzdata/Areas select Etc;
+	echo tzdata tzdata/Zones/Etc select UTC;
+} | debconf-set-selections
+
+apt-get update
+apt-get -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" \
+	--option=Dpkg::options::=--force-unsafe-io --no-install-recommends upgrade
+apt-get -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" \
+	--option=Dpkg::options::=--force-unsafe-io install --no-install-recommends \
+	ca-certificates \
+	curl \
+	git \
+	make \
+	mariadb-server \
+	nginx-light \
+	php-curl \
+	php-fpm \
+	php-mysql \
+	systemd-sysv
+
+test -f /etc/apt/sources.list.d/networkradius-freeradius.list || {
+	curl -f -o /etc/apt/trusted.gpg.d/networkradius.gpg.asc https://packages.networkradius.com/pgp/packages@networkradius.com
+	NRID=$ID
+	NRCN=$VERSION_CODENAME
+	case $ID in
+	ubuntu)
+		[ $NRCN != focal ] || { echo $NRID $NRCN is not supported; exit 1; }
+		;;
+	debian)
+		;;
+	*)
+		echo $NRID $NRCN is not supported
+		exit 1
+		;;
+	esac
+	printf 'deb [signed-by=/etc/apt/trusted.gpg.d/networkradius.gpg.asc] http://packages.networkradius.com/releases/%s-%s %s main\n' $NRID $NRCN $NRCN > /etc/apt/sources.list.d/networkradius-freeradius.list
+	apt-get update
+
+	case "${PACKER_BUILDER_TYPE:-}" in
+	docker)	# dev builds we do not need to generate a large DH
+		mkdir -p /etc/freeradius/certs
+		openssl dhparam -out /etc/freeradius/certs/dh 128
+		;;
+	esac
+}
+
+apt-get -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" \
+	--option=Dpkg::options::=--force-unsafe-io install --no-install-recommends \
+	freeradius \
+	freeradius-mysql \
+	freeradius-utils
+
+case "${PACKER_BUILDER_TYPE:-}" in
+null|docker)
+	;;
+*)
+	apt-get -y autoremove
+	apt-get clean
+	find /var/lib/apt/lists -type f -delete
+	;;
+esac
+
+test -h /usr/local/bin/radperf || {
+	SHA256SUM=1e2397896fd88121b4504668cbcd54959e39ec7050386483dcf6279e8f8128da
+	curl -f -L -o /tmp/radperf.tgz https://networkradius.com/assets/packages/radperf/radperf-2.0.1_Linux-x86_64.tgz
+	[ $(sha256sum /tmp/radperf.tgz | sed 's/ .*//') = $SHA256SUM ] || { echo mismatch >&2; exit 1; }
+	tar -C / -xf /tmp/radperf.tgz
+	rm /tmp/radperf.tgz
+	mkdir -p /usr/local/man/man1
+	ln -s -t /usr/local/man/man1 /opt/networkradius/radperf/doc/radperf.1
+	ln -s /opt/networkradius/radperf/bin/radperf /usr/local/bin
+}
+
+if [ -d /opt/$VENDOR/$PROJECT ]; then
+	git -C /opt/$VENDOR/$PROJECT reset --hard
+	git -C /opt/$VENDOR/$PROJECT pull origin HEAD
+else
+	mkdir /opt/$VENDOR
+	git clone /tmp/$VENDOR-$PROJECT.git /opt/$VENDOR/$PROJECT
+fi
+
+shred -u /tmp/$VENDOR-$PROJECT.git
+
+case "${PACKER_BUILDER_TYPE:-}" in
+docker)
+	# disable harmless error
+	systemctl mask dev-hugepages.mount
+	;;
+esac
+
+#test ! -f /etc/sysctl.conf || { echo /etc/sysctl.conf exists, remove and use /etc/sysctl.d/99-local.conf instead; exit 1; }
+ln -f -s /opt/$VENDOR/$PROJECT/sysctl.conf /etc/sysctl.d/60-$VENDOR-$PROJECT.conf
+if [ "${PACKER_BUILDER_TYPE:-}" = "null" ]; then
+	systemctl restart procps
+fi
+
+ln -f -s /opt/$VENDOR/$PROJECT/rsyslog.conf /etc/rsyslog.d/10-$VENDOR-$PROJECT.conf
+if [ "${PACKER_BUILDER_TYPE:-}" = "null" ]; then
+	systemctl restart rsyslog
+fi
+
+find /etc/nginx/sites-enabled -type f,l -delete
+find /opt/$VENDOR/$PROJECT/nginx/sites-available -type f | xargs -rt ln -s -t /etc/nginx/sites-enabled
+case "${PACKER_BUILDER_TYPE:-}" in
+docker)
+	test -f /etc/php/7.3/fpm/php.ini && PHPVER=7.3 || PHPVER=7.2
+	sed -i -e 's/^\(error_reporting =\).*/\1 E_ALL/; s/\(^display.*_errors =\).*/\1 On/; s/^\(log_errors =\).*/\1 On/' /etc/php/$PHPVER/fpm/php.ini
+	;;
+esac
+if [ "${PACKER_BUILDER_TYPE:-}" = "null" ]; then
+	systemctl start php7.3-fpm || systemctl start php7.2-fpm
+	systemctl reload php7.3-fpm || systemctl reload php7.2-fpm
+	test -S /run/php/php7.3-fpm.sock || sed -i -e 's/php7.3-fpm/php7.2-fpm/' /opt/$VENDOR/$PROJECT/nginx/sites-available/default
+	systemctl start nginx && systemctl reload nginx
+fi
+
+find /opt/$VENDOR/$PROJECT/mysql/mariadb.conf.d -type f | xargs -rt ln -f -s -t /etc/mysql/mariadb.conf.d
+case "${PACKER_BUILDER_TYPE:-}" in
+docker)	/etc/init.d/mysql start;;
+null)	systemctl start mysql;;
+esac
+mysql -e 'CREATE DATABASE IF NOT EXISTS radius'
+mysql radius < /opt/$VENDOR/$PROJECT/freeradius/mods-config/sql/main/mysql/schema.sql
+mysql radius < /opt/$VENDOR/$PROJECT/mysql/schema.sql
+test -f /opt/$VENDOR/$PROJECT/.stamp.sql || {
+	mysql radius < /etc/freeradius/mods-config/sql/main/mysql/setup.sql
+	mysql radius < /opt/$VENDOR/$PROJECT/mysql/setup.sql
+	touch /opt/$VENDOR/$PROJECT/.stamp.sql
+}
+case "${PACKER_BUILDER_TYPE:-}" in
+docker)
+	sed -i -e 's/^\(bind-address\s\+=\).*/\1 0.0.0.0/' /etc/mysql/mariadb.conf.d/50-server.cnf
+	mysql radius < /opt/$VENDOR/$PROJECT/mysql/dev.sql
+	;;
+esac
+if [ "${PACKER_BUILDER_TYPE:-}" = "docker" ]; then
+	/etc/init.d/mysql stop
+fi
+
+sed -i -e '/^After=/ { /mariadb/! s/.*/& mariadb.service/ }' /lib/systemd/system/freeradius.service
+[ "${PACKER_BUILDER_TYPE:-}" != "null" ] || systemctl daemon-reload
+sed -i -e 's/^\(proxy_requests =\).*/\1 no/; s/#\(\s\+\$INCLUDE mods-enabled\/sql\)/\1/' /etc/freeradius/radiusd.conf
+sed -i -e "/^\$INCLUDE \/opt\/$VENDOR\/$PROJECT\// d" /etc/freeradius/dictionary
+sed -i -e "\$a \$INCLUDE /opt/$VENDOR/$PROJECT/freeradius/dictionary" /etc/freeradius/dictionary
+find /opt/$VENDOR/$PROJECT/freeradius/certs -type f | xargs -rt ln -s -f -t /etc/freeradius/certs
+find /opt/$VENDOR/$PROJECT/freeradius/policy.d -type f | xargs -rt ln -s -f -t /etc/freeradius/policy.d
+find /etc/freeradius/mods-enabled /etc/freeradius/sites-enabled -type f,l -delete
+find /opt/$VENDOR/$PROJECT/freeradius/mods-available -type f,l | xargs -rt ln -s -t /etc/freeradius/mods-enabled
+find /opt/$VENDOR/$PROJECT/freeradius/sites-available -type f,l | xargs -rt ln -s -t /etc/freeradius/sites-enabled
+
+freeradius -C || freeradius -CX
+if [ "${PACKER_BUILDER_TYPE:-}" = "null" ]; then
+	systemctl start freeradius
+	systemctl reload freeradius
+fi
+
+cp /opt/$VENDOR/$PROJECT/cron /etc/cron.d/$VENDOR-$PROJECT
+systemctl restart cron
+
+exit 0
