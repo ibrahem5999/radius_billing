@@ -1,0 +1,10 @@
+*/5 * * * * root php -q /opt/public_html/cron_exec/steal_session.php
+
+0 * * * * root php -q /opt/public_html/cron_exec/free_times_cards.php
+
+*/40 * * * * root php -q /opt/public_html/cron_exec/disconect_all.php
+
+*/55 * * * * root php -q /opt/public_html/cron_exec/network_status.php
+
+55 23 * * * root php -q /opt/public_html/cron_exec/daily_sale.php
+
