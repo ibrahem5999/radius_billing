@@ -75,7 +75,7 @@ ifneq ($(shell id -u),0)
 	@{ echo you need to run this as root >&2; exit 1; }
 endif
 	git bundle create /tmp/$(VENDOR)-$(PROJECT).git HEAD
-	env VENDOR=$(VENDOR) PROJECT=$(PROJECT) PACKER_BUILDER_TYPE=null /bin/sh $(CURDIR)/setup
+	#env VENDOR=$(VENDOR) PROJECT=$(PROJECT) PACKER_BUILDER_TYPE=null /bin/sh $(CURDIR)/setup
 
 SSH_USER ?= $(USER)
 .PHONY: deploy-remote
